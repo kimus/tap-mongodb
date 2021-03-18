@@ -117,6 +117,24 @@ def get_databases(client, config):
     LOGGER.info('Datbases: %s', db_names)
     return db_names
 
+def get_collection_schema_from_rows(collection):
+    LOGGER.info('Getting schema from collection data: %s.%s', collection.database.name, collection.name)
+    schema = {
+        'type': 'object',
+        'properties': {
+            '_id': { 'type': ['null', 'string'] }
+        }
+    }
+
+    # TODO: add limit to a configuration
+    with collection.find().sort('_id', -1).limit(5) as cursor:
+        for row in cursor:
+            try:
+                common.row_to_schema(schema, row)
+            except Exception as e:
+                LOGGER.critical(e)
+
+    return schema
 
 def produce_collection_schema(collection):
     collection_name = collection.name
@@ -146,15 +164,15 @@ def produce_collection_schema(collection):
 
         if valid_replication_keys:
             mdata = metadata.write(mdata, (), 'valid-replication-keys', valid_replication_keys)
+    
+        schema = get_collection_schema_from_rows(collection)
 
     return {
         'table_name': collection_name,
         'stream': collection_name,
         'metadata': metadata.to_list(mdata),
         'tap_stream_id': "{}-{}".format(collection_db_name, collection_name),
-        'schema': {
-            'type': 'object'
-        }
+        'schema': schema
     }
 
 
@@ -384,7 +402,7 @@ def main_impl():
         do_discover(client, config)
     elif args.catalog:
         state = args.state or {}
-        do_sync(client, args.catalog.to_dict(), state)
+        do_sync(client, args.catalog.to_dict(), state)        
 
 def main():
     try:
