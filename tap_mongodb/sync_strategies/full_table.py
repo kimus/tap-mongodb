@@ -97,7 +97,6 @@ def sync_collection(client, stream, state, projection):
     # pylint: disable=logging-format-interpolation
     LOGGER.info(query_message)
 
-
     with collection.find({'_id': find_filter},
                          projection,
                          sort=[("_id", pymongo.ASCENDING)]) as cursor:
@@ -105,7 +104,7 @@ def sync_collection(client, stream, state, projection):
         time_extracted = utils.now()
         start_time = time.time()
 
-        schema = {"type": "object", "properties": {}}
+        schema = stream['schema'] or {"type": "object", "properties": {}}
         for row in cursor:
             rows_saved += 1
 

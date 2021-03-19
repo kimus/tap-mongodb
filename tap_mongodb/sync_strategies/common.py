@@ -118,13 +118,50 @@ def safe_transform_datetime(value, path):
             value)) from ex
     return utils.strftime(utc_datetime)
 
+def get_field_type(any_of):
+    ftype = None
+    try:
+        # find first type that is not null
+        ftype = next(entry for entry in any_of or [] if not entry.get('type') == 'null')
+    except StopIteration:
+        pass
+    return ftype
+
+def get_field_info(schema, path):
+    path = path.copy()
+    fschema = schema
+    while isinstance(fschema, dict) and len(path) > 0:
+        field = path.pop(0)
+        fschema = {} if not fschema else fschema.get(field) or {}
+        ftype = None
+        any_of = fschema.get('anyOf')
+        if any_of:
+            ftype = get_field_type(any_of)
+            name = None if not ftype else ftype.get('type')
+            if name == 'object':
+                fschema = ftype.get('properties')
+            else:
+                fschema = None # stop traversing path if needed
+    if len(path) != 0:
+        return None
+    return ftype
+
 # pylint: disable=too-many-return-statements,too-many-branches
-def transform_value(value, path):
+def transform_value(value, path, schema):
+    # TODO: validate tyoe by schema definition
+
+    if isinstance(value, int):
+        # fix int values that are mixed with strings and detected has string in schema
+        # by converting value to string
+        ftype = get_field_info(schema, path)
+        if isinstance(ftype, dict) and ftype.get('type') == 'string':
+            return str(value)
+        return value
     if isinstance(value, list):
         # pylint: disable=unnecessary-lambda
-        return list(map(lambda v: transform_value(v[1], path + [v[0]]), enumerate(value)))
+        return list(map(lambda v: transform_value(v[1], path + [v[0]], schema), enumerate(value)))
     if isinstance(value, dict):
-        return {k:transform_value(v, path + [k]) for k, v in value.items()}
+        return {k:transform_value(v, path + [k], schema) for k, v in value.items()}
     if isinstance(value, uuid.UUID):
         return str(value)
     if isinstance(value, objectid.ObjectId):
@@ -166,11 +203,19 @@ def transform_value(value, path):
 
     return value
 
+def isvalid(properties, field, value):
+    # TODO: validate value structure
+    fschema = properties.get(field)
+    return fschema and type(value) not in [bson.min_key.MinKey, bson.max_key.MaxKey]
+
 def row_to_singer_record(stream, row, version, time_extracted):
     # pylint: disable=unidiomatic-typecheck
     try:
-        row_to_persist = {k:transform_value(v, [k]) for k, v in row.items()
-                          if type(v) not in [bson.min_key.MinKey, bson.max_key.MaxKey]}
+        schema = stream['schema']
+        properties = schema.get('properties', {})
+        row_to_persist = {
+            k: transform_value(v, [k], properties)
+                for k, v in row.items() if isvalid(properties, k, v) }
     except MongoInvalidDateTimeException as ex:
         raise Exception("Error syncing collection {}, object ID {} - {}".format(stream["tap_stream_id"], row['_id'], ex)) from ex
 
@@ -187,7 +232,7 @@ def create_anyof(schema=None):
             schema = [{ 'type': t } for t in tp]
         else:
             schema = [schema]
-    return { 'anyOf': schema or [{ 'type': 'null' }] }
+    return { 'anyOf': [{ 'type': 'null' }] if schema is None else schema }
 
 def get_match(entry, key, value=None):
     if isinstance(entry, dict):
@@ -199,6 +244,18 @@ def get_match(entry, key, value=None):
 def get_entry_type(entry, value):
     return get_match(entry, 'type', value)
 
+def set_schema_type(schema, tschema):
+    #ftype = get_field_type(schema)
+    #if ftype:
+    #    schema.remove(ftype)
+    insert_schema_type(schema, tschema)
+
+def insert_schema_type(schema, tschema):
+    schema.insert(0, tschema)
+
+def append_schema_type(schema, tschema):
+    schema.insert(len(schema), tschema)
+
 def add_to_any_of(schema, value):
     changed = False
 
@@ -209,17 +266,20 @@ def add_to_any_of(schema, value):
                 has_bool = True
                 break
         if not has_bool:
-            schema.insert(0, {"type": "boolean"})
+            set_schema_type(schema, { 'type': 'boolean' })
             changed = True
 
-    elif not value:
+    elif value is None:
         has_none = False
         for field_schema_entry in schema:
             if get_entry_type(field_schema_entry, 'null'):
                 has_none = True
                 break
+        if (has_none and len(schema) == 1) or (not has_none and len(schema == 0)):
+            # set default to string. this would be overriden later if other type detected
+            set_schema_type(schema, { 'type': 'string' })
         if not has_none:
-            schema.insert(0, {"type": "null"})
+            append_schema_type(schema, { 'type': 'null' })
             changed = True
 
     elif isinstance(value, (str, objectid.ObjectId)):
@@ -229,7 +289,7 @@ def add_to_any_of(schema, value):
                 has_string = True
                 break
         if not has_string:
-            schema.insert(0, {"type": "string"})
+            set_schema_type(schema, { 'type': 'string' })
             changed = True
 
     elif isinstance(value, (bson_datetime.datetime, timestamp.Timestamp, datetime.datetime)):
@@ -239,7 +299,7 @@ def add_to_any_of(schema, value):
                 has_date = True
                 break
         if not has_date:
-            schema.insert(0, {"type": "string", "format": "date-time"})
+            set_schema_type(schema, { 'type': 'string', 'format': 'date-time' })
             changed = True
     
     elif isinstance(value, int):
@@ -251,7 +311,7 @@ def add_to_any_of(schema, value):
                 has_int = True
 
         if not has_int:
-            schema.insert(0, {"type": "number" })
+            set_schema_type(schema, { 'type': 'number' })
             changed = True
 
     elif isinstance(value, bson.decimal128.Decimal128):
@@ -268,10 +328,11 @@ def add_to_any_of(schema, value):
                 has_decimal = True
 
         if not has_decimal:
+            fs = { 'type': 'number', 'multipleOf': decimal.Decimal('1e-34') }
             if has_date:
-                schema.insert(1, {"type": "number", "multipleOf": decimal.Decimal('1e-34')})
+                append_schema_type(schema, fs)
             else:
-                schema.insert(0, {"type": "number", "multipleOf": decimal.Decimal('1e-34')})
+                insert_schema_type(schema, fs)
             changed = True
 
     elif isinstance(value, float):
@@ -289,9 +350,9 @@ def add_to_any_of(schema, value):
 
         if not has_float:
             if has_date:
-                schema.insert(1, {"type": "number"})
+                append_schema_type(schema, { 'type': 'number' })
             else:
-                schema.insert(0, {"type": "number"})
+                insert_schema_type(schema, { 'type': 'number' })
 
             changed = True
 
@@ -312,13 +373,13 @@ def add_to_any_of(schema, value):
             # if it changed and existed, it's reference was modified
             # if it changed and didn't exist, insert it
             if not has_object:
-                schema.insert(-1, object_schema)
+                append_schema_type(schema, object_schema)
 
     elif isinstance(value, list):
         has_list = False
 
         # get pointer to list's anyOf schema and see if list schema already existed
-        list_schema = {"type": "array", "items": create_anyof()}
+        list_schema = { 'type': 'array', 'items': create_anyof() }
         for field_schema_entry in schema:
             if get_entry_type(field_schema_entry, 'array'):
                 list_schema = field_schema_entry
@@ -330,11 +391,11 @@ def add_to_any_of(schema, value):
         for list_entry in value:
             list_entry_changed = add_to_any_of(anyof_schema, list_entry) or list_entry_changed
             changed = changed or list_entry_changed
-
+        
         # if it changed and existed, it's reference was modified
         # if it changed and didn't exist, insert it
-        if not has_list and list_entry_changed:
-            schema.insert(-1, list_schema)
+        if not has_list or list_entry_changed:
+            set_schema_type(schema, list_schema)
 
     return changed
 

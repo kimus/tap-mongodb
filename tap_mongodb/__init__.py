@@ -127,7 +127,7 @@ def get_collection_schema_from_rows(collection):
     }
 
     # TODO: add limit to a configuration
-    with collection.find().sort('_id', -1).limit(5) as cursor:
+    with collection.find().sort('_id', -1).limit(20000) as cursor:
         for row in cursor:
             try:
                 common.row_to_schema(schema, row)
