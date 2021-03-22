@@ -23,6 +23,7 @@ REQUIRED_CONFIG_KEYS = [
     'port',
     'user',
     'password',
+    'auth_database',
     'database'
 ]
 
@@ -68,7 +69,8 @@ def get_roles(client, config):
     #         }
     #     ]
     # }
-    user_info = client[config['database']].command({'usersInfo': config['user']})
+    db_name = config.get('auth_database', config.get('database', 'admin'))
+    user_info = client[db_name].command({'usersInfo': config['user']})
 
     users = [u for u in user_info.get('users') if u.get('user') == config['user']]
     if len(users) != 1:
@@ -92,7 +94,7 @@ def get_roles(client, config):
 
         # for custom roles, get the "sub-roles"
         else:
-            role_info_list = client[config['database']].command(
+            role_info_list = client[db_name].command(
                 {'rolesInfo': {'role': role_name, 'db': config['database']}})
             role_info = [r for r in role_info_list.get('roles', []) if r['role'] == role_name]
             if len(role_info) != 1:
@@ -117,7 +119,7 @@ def get_databases(client, config):
     LOGGER.info('Datbases: %s', db_names)
     return db_names
 
-def get_collection_schema_from_rows(collection):
+def get_collection_schema_from_rows(collection, config):
     LOGGER.info('Getting schema from collection data: %s.%s', collection.database.name, collection.name)
     schema = {
         'type': 'object',
@@ -126,8 +128,8 @@ def get_collection_schema_from_rows(collection):
         }
     }
 
-    # TODO: add limit to a configuration
-    with collection.find().sort('_id', -1).limit(20000) as cursor:
+    limit = config.get('discovery_row_limit', 1000)
+    with collection.find().sort('_id', -1).limit(limit) as cursor:
         for row in cursor:
             try:
                 common.row_to_schema(schema, row)
@@ -136,7 +138,7 @@ def get_collection_schema_from_rows(collection):
 
     return schema
 
-def produce_collection_schema(collection):
+def produce_collection_schema(collection, config):
     collection_name = collection.name
     collection_db_name = collection.database.name
 
@@ -165,7 +167,7 @@ def produce_collection_schema(collection):
         if valid_replication_keys:
             mdata = metadata.write(mdata, (), 'valid-replication-keys', valid_replication_keys)
     
-        schema = get_collection_schema_from_rows(collection)
+        schema = get_collection_schema_from_rows(collection, config)
 
     return {
         'table_name': collection_name,
@@ -179,23 +181,26 @@ def produce_collection_schema(collection):
 def do_discover(client, config):
     streams = []
 
+    database = config.get('database')
+
     for db_name in get_databases(client, config):
-        # pylint: disable=invalid-name
-        db = client[db_name]
+        if not database or db_name == database:
+            # pylint: disable=invalid-name
+            db = client[db_name]
 
-        collection_names = db.list_collection_names()
-        for collection_name in [c for c in collection_names
-                                if not c.startswith("system.")]:
+            collection_names = db.list_collection_names()
+            for collection_name in [c for c in collection_names
+                                    if not c.startswith("system.")]:
 
-            collection = db[collection_name]
-            is_view = collection.options().get('viewOn') is not None
-            # TODO: Add support for views
-            if is_view:
-                continue
+                collection = db[collection_name]
+                is_view = collection.options().get('viewOn') is not None
+                # TODO: Add support for views
+                if is_view:
+                    continue
 
-            LOGGER.info("Getting collection info for db: %s, collection: %s",
-                        db_name, collection_name)
-            streams.append(produce_collection_schema(collection))
+                LOGGER.info("Getting collection info for db: %s, collection: %s",
+                            db_name, collection_name)
+                streams.append(produce_collection_schema(collection, config))
 
     json.dump({'streams' : streams}, sys.stdout, indent=2)
 
@@ -380,7 +385,7 @@ def main_impl():
                          "port": int(config['port']),
                          "username": config.get('user', None),
                          "password": config.get('password', None),
-                         "authSource": config['database'],
+                         "authSource": config.get('auth_database', config.get('database')),
                          "ssl": use_ssl,
                          "replicaset": config.get('replica_set', None),
                          "readPreference": 'secondaryPreferred'}
@@ -402,7 +407,7 @@ def main_impl():
         do_discover(client, config)
     elif args.catalog:
         state = args.state or {}
-        do_sync(client, args.catalog.to_dict(), state)        
+        do_sync(client, args.catalog.to_dict(), state)
 
 def main():
     try:
