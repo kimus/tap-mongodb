@@ -2,6 +2,9 @@
 
 This is a [Singer](https://singer.io) tap that produces JSON-formatted data following the [Singer spec](https://github.com/singer-io/getting-started/blob/master/SPEC.md) from a MongoDB source.
 
+> This variant fork adds `auth_database` and `discovery_row_limit` configuration parameters.
+
+
 ## Set up Virtual Environment
 ```
 python3 -m venv ~/.virtualenvs/tap-mongodb
