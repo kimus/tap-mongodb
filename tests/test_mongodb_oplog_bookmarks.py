@@ -33,23 +33,19 @@ def generate_simple_coll_docs(num_docs):
         docs.append({"int_field": int_value, "string_field": random_string_generator()})
     return docs
 
-class MongoDBOplog(unittest.TestCase):
+class MongoDBOplogBookmarks(unittest.TestCase):
     def setUp(self):
 
         ensure_environment_variables_set()
 
         with get_test_connection() as client:
-            ############# Drop all dbs/collections #############
             drop_all_collections(client)
 
-            ############# Add simple collections #############
             # simple_coll_1 has 50 documents
             client["simple_db"]["simple_coll_1"].insert_many(generate_simple_coll_docs(50))
 
             # simple_coll_2 has 100 documents
             client["simple_db"]["simple_coll_2"].insert_many(generate_simple_coll_docs(100))
-
-
 
 
     def expected_check_streams(self):
@@ -68,17 +64,18 @@ class MongoDBOplog(unittest.TestCase):
         return {
             'simple_coll_1': 50,
             'simple_coll_2': 100,
+
         }
 
 
     def expected_sync_streams(self):
         return {
             'simple_coll_1',
-            'simple_coll_2'
+            'simple_coll_2',
         }
 
     def name(self):
-        return "tap_tester_mongodb_oplog"
+        return "tap_tester_mongodb_oplog_bookmarks"
 
     def tap_name(self):
         return "tap-mongodb"
@@ -90,10 +87,11 @@ class MongoDBOplog(unittest.TestCase):
         return {'password': os.getenv('TAP_MONGODB_PASSWORD')}
 
     def get_properties(self):
-        return {'host' : os.getenv('TAP_MONGODB_HOST'),
-                'port' : os.getenv('TAP_MONGODB_PORT'),
-                'user' : os.getenv('TAP_MONGODB_USER'),
-                'database' : os.getenv('TAP_MONGODB_DBNAME')
+        return {
+            'host' : os.getenv('TAP_MONGODB_HOST'),
+            'port' : os.getenv('TAP_MONGODB_PORT'),
+            'user' : os.getenv('TAP_MONGODB_USER'),
+            'database' : os.getenv('TAP_MONGODB_DBNAME')
         }
 
 
@@ -119,8 +117,6 @@ class MongoDBOplog(unittest.TestCase):
         self.assertEqual(self.expected_check_streams(),
                          {c['tap_stream_id'] for c in found_catalogs})
 
-
-
         for tap_stream_id in self.expected_check_streams():
             found_stream = [c for c in found_catalogs if c['tap_stream_id'] == tap_stream_id][0]
 
@@ -135,14 +131,16 @@ class MongoDBOplog(unittest.TestCase):
         #  -----------------------------------
         # ----------- Initial Full Table ---------
         #  -----------------------------------
-        # Select simple_coll_1 and simple_coll_2 streams and add replication method metadata
+        # Select simple_coll_1 and add replication method metadata
+        additional_md = [{ "breadcrumb" : [],
+                           "metadata" : {'replication-method' : 'LOG_BASED'}}]
         for stream_catalog in found_catalogs:
-            annotated_schema = menagerie.get_annotated_schema(conn_id, stream_catalog['stream_id'])
-            additional_md = [{ "breadcrumb" : [], "metadata" : {'replication-method' : 'LOG_BASED'}}]
-            selected_metadata = connections.select_catalog_and_fields_via_metadata(conn_id,
-                                                                                    stream_catalog,
-                                                                                    annotated_schema,
-                                                                                    additional_md)
+            if stream_catalog['tap_stream_id'] == 'simple_db-simple_coll_1':
+                annotated_schema = menagerie.get_annotated_schema(conn_id, stream_catalog['stream_id'])
+                selected_metadata = connections.select_catalog_and_fields_via_metadata(conn_id,
+                                                                                       stream_catalog,
+                                                                                       annotated_schema,
+                                                                                       additional_md)
 
         # Run sync
         sync_job_name = runner.run_sync_mode(self, conn_id)
@@ -161,59 +159,45 @@ class MongoDBOplog(unittest.TestCase):
                                                                    self.expected_pks())
 
         # Verify that the full table was synced
-        for tap_stream_id in self.expected_sync_streams():
-            self.assertGreaterEqual(record_count_by_stream[tap_stream_id],self.expected_row_counts()[tap_stream_id])
+        tap_stream_id = 'simple_db-simple_coll_1'
+        self.assertGreaterEqual(record_count_by_stream['simple_coll_1'],
+                                self.expected_row_counts()['simple_coll_1'])
 
         # Verify that we have 'initial_full_table_complete' bookmark
         state = menagerie.get_state(conn_id)
         first_versions = {}
 
-        for tap_stream_id in self.expected_check_streams():
-            # assert that the state has an initial_full_table_complete == True
-            self.assertTrue(state['bookmarks'][tap_stream_id]['initial_full_table_complete'])
-            # assert that there is a version bookmark in state
-            first_versions[tap_stream_id] = state['bookmarks'][tap_stream_id]['version']
-            self.assertIsNotNone(first_versions[tap_stream_id])
-            # Verify that we have a oplog_ts_time and oplog_ts_inc bookmark
-            self.assertIsNotNone(state['bookmarks'][tap_stream_id]['oplog_ts_time'])
-            self.assertIsNotNone(state['bookmarks'][tap_stream_id]['oplog_ts_inc'])
+        # assert that the state has an initial_full_table_complete == True
+        self.assertTrue(state['bookmarks'][tap_stream_id]['initial_full_table_complete'])
+        # assert that there is a version bookmark in state
+        first_versions[tap_stream_id] = state['bookmarks'][tap_stream_id]['version']
+        self.assertIsNotNone(first_versions[tap_stream_id])
+        # Verify that we have a oplog_ts_time and oplog_ts_inc bookmark
+        self.assertIsNotNone(state['bookmarks'][tap_stream_id]['oplog_ts_time'])
+        self.assertIsNotNone(state['bookmarks'][tap_stream_id]['oplog_ts_inc'])
+
+
+
+        # Insert records to coll_1 to get the bookmark to be a ts on coll_1
+        with get_test_connection() as client:
+            client["simple_db"]["simple_coll_1"].insert_one({"int_field": 101, "string_field": random_string_generator()})
+        sync_job_name = runner.run_sync_mode(self, conn_id)
 
 
         changed_ids = set()
         with get_test_connection() as client:
-            # Delete two documents for each collection
-
-            changed_ids.add(client['simple_db']['simple_coll_1'].find({'int_field': 0})[0]['_id'])
-            client["simple_db"]["simple_coll_1"].delete_one({'int_field': 0})
-
-            changed_ids.add(client['simple_db']['simple_coll_1'].find({'int_field': 1})[0]['_id'])
-            client["simple_db"]["simple_coll_1"].delete_one({'int_field': 1})
-
+            # Make changes to not selected collection
             changed_ids.add(client['simple_db']['simple_coll_2'].find({'int_field': 0})[0]['_id'])
             client["simple_db"]["simple_coll_2"].delete_one({'int_field': 0})
 
             changed_ids.add(client['simple_db']['simple_coll_2'].find({'int_field': 1})[0]['_id'])
             client["simple_db"]["simple_coll_2"].delete_one({'int_field': 1})
 
-            # Update two documents for each collection
-            changed_ids.add(client['simple_db']['simple_coll_1'].find({'int_field': 48})[0]['_id'])
-            client["simple_db"]["simple_coll_1"].update_one({'int_field': 48},{'$set': {'int_field': -1}})
-
-            changed_ids.add(client['simple_db']['simple_coll_1'].find({'int_field': 49})[0]['_id'])
-            client["simple_db"]["simple_coll_1"].update_one({'int_field': 49},{'$set': {'int_field': -1}})
-
             changed_ids.add(client['simple_db']['simple_coll_2'].find({'int_field': 98})[0]['_id'])
             client["simple_db"]["simple_coll_2"].update_one({'int_field': 98},{'$set': {'int_field': -1}})
 
             changed_ids.add(client['simple_db']['simple_coll_2'].find({'int_field': 99})[0]['_id'])
             client["simple_db"]["simple_coll_2"].update_one({'int_field': 99},{'$set': {'int_field': -1}})
-
-            # Insert two documents for each collection
-            client["simple_db"]["simple_coll_1"].insert_one({"int_field": 50, "string_field": random_string_generator()})
-            changed_ids.add(client['simple_db']['simple_coll_1'].find({'int_field': 50})[0]['_id'])
-
-            client["simple_db"]["simple_coll_1"].insert_one({"int_field": 51, "string_field": random_string_generator()})
-            changed_ids.add(client['simple_db']['simple_coll_1'].find({'int_field': 51})[0]['_id'])
 
             client["simple_db"]["simple_coll_2"].insert_one({"int_field": 100, "string_field": random_string_generator()})
             changed_ids.add(client['simple_db']['simple_coll_2'].find({'int_field': 100})[0]['_id'])
@@ -226,19 +210,18 @@ class MongoDBOplog(unittest.TestCase):
         #  -----------------------------------
 
         # Run sync
-
         sync_job_name = runner.run_sync_mode(self, conn_id)
 
         exit_status = menagerie.get_exit_status(conn_id, sync_job_name)
         menagerie.verify_sync_exit_status(self, exit_status, sync_job_name)
 
-
         # verify the persisted schema was correct
         messages_by_stream = runner.get_records_from_target_output()
-        records_by_stream = {}
-        for stream_name in self.expected_sync_streams():
-            records_by_stream[stream_name] = [x for x in messages_by_stream[stream_name]['messages'] if x.get('action') == 'upsert']
-
+        records_by_stream = {
+            'simple_coll_1': [x
+                              for x in messages_by_stream['simple_coll_1']['messages']
+                              if x.get('action') == 'upsert']
+        }
 
         # assert that each of the streams that we synced are the ones that we expect to see
         record_count_by_stream = runner.examine_target_output_file(self,
@@ -246,15 +229,17 @@ class MongoDBOplog(unittest.TestCase):
                                                                    self.expected_sync_streams(),
                                                                    self.expected_pks())
 
-        # Verify that we got at least 6 records due to changes
-        # (could be more due to overlap in gte oplog clause)
-        for k,v in record_count_by_stream.items():
-            self.assertGreaterEqual(v, 6)
+        # 1 record due to fencepost querying on oplog ts
+        self.assertEqual(1, record_count_by_stream['simple_coll_1'])
 
-        # Verify that we got 2 records with _SDC_DELETED_AT
-        self.assertEqual(2, len([x['data'] for x in records_by_stream['simple_coll_1'] if x['data'].get('_sdc_deleted_at')]))
-        self.assertEqual(2, len([x['data'] for x in records_by_stream['simple_coll_2'] if x['data'].get('_sdc_deleted_at')]))
-        # Verify that the _id of the records sent are the same set as the
-        # _ids of the documents changed
-        actual = set([ObjectId(x['data']['_id']) for x in records_by_stream['simple_coll_1']]).union(set([ObjectId(x['data']['_id']) for x in records_by_stream['simple_coll_2']]))
-        self.assertEqual(changed_ids, actual)
+        final_state = menagerie.get_state(conn_id)
+
+        with get_test_connection() as client:
+            row = client.local.oplog.rs.find_one(sort=[('$natural', pymongo.DESCENDING)])
+            latest_oplog_ts = row.get('ts')
+
+        self.assertEqual(
+            (latest_oplog_ts.time, latest_oplog_ts.inc),
+            (final_state['bookmarks']['simple_db-simple_coll_1']['oplog_ts_time'],
+             final_state['bookmarks']['simple_db-simple_coll_1']['oplog_ts_inc'])
+        )

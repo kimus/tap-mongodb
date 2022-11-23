@@ -1,4 +1,3 @@
-from tap_tester.scenario import (SCENARIOS)
 import tap_tester.connections as connections
 import tap_tester.menagerie   as menagerie
 import tap_tester.runner      as runner
@@ -17,21 +16,12 @@ import bson
 import singer
 from functools import reduce
 from singer import utils, metadata
-from mongodb_common import drop_all_collections
+from mongodb_common import drop_all_collections, get_test_connection, ensure_environment_variables_set
 import decimal
 
 
 RECORD_COUNT = {}
 
-def get_test_connection():
-    username = os.getenv('TAP_MONGODB_USER')
-    password = os.getenv('TAP_MONGODB_PASSWORD')
-    host= os.getenv('TAP_MONGODB_HOST')
-    auth_source = os.getenv('TAP_MONGODB_DBNAME')
-    port = os.getenv('TAP_MONGODB_PORT')
-    ssl = False
-    conn = pymongo.MongoClient(host=host, username=username, password=password, port=27017, authSource=auth_source, ssl=ssl)
-    return conn
 
 def random_string_generator(size=6, chars=string.ascii_uppercase + string.digits):
     return ''.join(random.choice(chars) for x in range(size))
@@ -44,14 +34,7 @@ def generate_simple_coll_docs(num_docs):
 
 class MongoDBOplogAgedOut(unittest.TestCase):
     def setUp(self):
-        if not all([x for x in [os.getenv('TAP_MONGODB_HOST'),
-                                os.getenv('TAP_MONGODB_USER'),
-                                os.getenv('TAP_MONGODB_PASSWORD'),
-                                os.getenv('TAP_MONGODB_PORT'),
-                                os.getenv('TAP_MONGODB_DBNAME')]]):
-            #pylint: disable=line-too-long
-            raise Exception("set TAP_MONGODB_HOST, TAP_MONGODB_USER, TAP_MONGODB_PASSWORD, TAP_MONGODB_PORT, TAP_MONGODB_DBNAME")
-
+        ensure_environment_variables_set()
 
         with get_test_connection() as client:
             ############# Drop all dbs/collections #############
@@ -191,10 +174,8 @@ class MongoDBOplogAgedOut(unittest.TestCase):
         # assert that all rows in the collection were sync'd
         for stream_id, row_count in self.expected_row_counts().items():
             self.assertGreaterEqual(record_count_by_stream[stream_id], row_count)
-        
+
         # assert that each stream has a initial_full_table_complete=True bookmark
         self.assertIsNotNone(final_state.get('bookmarks', {}).get('simple_db-simple_coll_1', {}).get('oplog_ts_time'))
         self.assertIsNotNone(final_state.get('bookmarks', {}).get('simple_db-simple_coll_1', {}).get('oplog_ts_inc'))
         self.assertTrue(final_state.get('bookmarks', {}).get('simple_db-simple_coll_1', {}).get('initial_full_table_complete'))
-        
-SCENARIOS.add(MongoDBOplogAgedOut)
